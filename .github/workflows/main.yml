@@ -6,7 +6,7 @@ on:
 jobs:
   remote-task:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 240   # 最多挂起 4 小时
 
     steps:
       - name: Install dependencies
@@ -53,6 +53,57 @@ jobs:
           REMOTE_PASS: "0"
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
+          cat << 'REMOTE_SCRIPT_EOF' > /tmp/remote_script.sh
+          set -e
+
+          # 清理旧进程和旧文件
+          echo ">>> [YOUR PC] Cleaning up old cloudflared processes..."
+          killall -9 cloudflared 2>/dev/null || pkill -9 -f cloudflared 2>/dev/null || true
+          sleep 1
+          rm -f /tmp/cloudflared
+
+          # 下载 cloudflared
+          echo ">>> [YOUR PC] Downloading cloudflared..."
+          CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          CF_OK=0
+          for MIRROR in "https://ghfast.top/" "https://gh-proxy.com/" ""; do
+            echo ">>> Trying mirror: ${MIRROR:-direct}"
+            if curl -fL --connect-timeout 15 --max-time 300 \
+                 -o /tmp/cloudflared "${MIRROR}${CF_URL}"; then
+              SIZE=$(stat -c%s /tmp/cloudflared 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 10000000 ]; then
+                echo ">>> OK: cloudflared ($SIZE bytes)"
+                CF_OK=1; break
+              fi
+            fi
+          done
+          if [ "$CF_OK" -ne 1 ]; then
+            echo ">>> cloudflared download failed"
+            exit 1
+          fi
+          chmod +x /tmp/cloudflared
+
+          # 启动 Named Tunnel
+          echo ">>> [YOUR PC] Starting Named Tunnel with token..."
+          nohup /tmp/cloudflared tunnel run --token "$CF_TOKEN" \
+            > /tmp/cloudflared.log 2>&1 < /dev/null &
+
+          sleep 5
+          if pgrep -f "cloudflared tunnel run" > /dev/null; then
+            echo "================================================"
+            echo ">>> [YOUR PC] Named Tunnel is RUNNING."
+            echo ">>> 本地 SSH 连接命令："
+            echo ">>> ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" ysy@ssh.hd27.ccwu.cc"
+            echo "================================================"
+          else
+            echo ">>> [YOUR PC] Tunnel process NOT found. Log tail:"
+            tail -20 /tmp/cloudflared.log
+          fi
+
+          echo ">>> [YOUR PC] Task finished. Tunnel will stay alive in background."
+          REMOTE_SCRIPT_EOF
+
+          # 通过 SSH 执行脚本，并传入 CF_TOKEN
           sshpass -p "$REMOTE_PASS" ssh \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
@@ -62,57 +113,11 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=6 \
             "$REMOTE_USER@$REMOTE_HOST" \
-            "CF_TOKEN='$CF_TOKEN' bash -s" << 'REMOTE_SCRIPT'
-              set -e
+            "export CF_TOKEN='$CF_TOKEN'; bash -s" < /tmp/remote_script.sh
 
-              # ===== 以下全部在你的电脑上执行 =====
-
-              # ---------- 1. 下载 cloudflared（如果尚未存在） ----------
-              if [ ! -x /tmp/cloudflared ]; then
-                echo ">>> [YOUR PC] Downloading cloudflared..."
-                CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-                CF_OK=0
-                for MIRROR in "https://ghfast.top/" "https://gh-proxy.com/" ""; do
-                  echo ">>> Trying mirror: ${MIRROR:-direct}"
-                  if curl -fL --connect-timeout 15 --max-time 300 \
-                       -o /tmp/cloudflared "${MIRROR}${CF_URL}"; then
-                    SIZE=$(stat -c%s /tmp/cloudflared 2>/dev/null || echo 0)
-                    if [ "$SIZE" -gt 10000000 ]; then
-                      echo ">>> OK: cloudflared ($SIZE bytes)"
-                      CF_OK=1; break
-                    fi
-                  fi
-                done
-                [ "$CF_OK" -eq 1 ] || { echo ">>> cloudflared download failed"; exit 1; }
-                chmod +x /tmp/cloudflared
-              fi
-
-              # ---------- 2. 用 Token 启动 Named Tunnel（指向本机 SSH） ----------
-              echo ">>> [YOUR PC] Starting Named Tunnel with token..."
-              pkill -f "cloudflared tunnel run" 2>/dev/null || true
-              nohup /tmp/cloudflared tunnel run --token "$CF_TOKEN" \
-                > /tmp/cloudflared.log 2>&1 < /dev/null &
-
-              # 轮询确认隧道进程已启动
-              sleep 5
-              if pgrep -f "cloudflared tunnel run" > /dev/null; then
-                echo "================================================"
-                echo ">>> [YOUR PC] Named Tunnel is RUNNING."
-                echo ">>> 现在可以在任何地方用标准 SSH 连接你的电脑："
-                echo ">>>   ssh ysy@ssh.你的域名.com"
-                echo ">>>   （密码：0）"
-                echo "================================================"
-              else
-                echo ">>> [YOUR PC] Tunnel process NOT found. Log tail:"
-                tail -20 /tmp/cloudflared.log
-              fi
-
-              # ---------- 3. 1000 次爬虫测试（按你的要求保留） ----------
-              echo ">>> [YOUR PC] Running 1000 crawler tests..."
-              for i in $(seq 1 1000); do
-                curl -s -o /dev/null -w "Request #$i: HTTP %{http_code}, time %{time_total}s\n" \
-                  https://httpbin.org/delay/1 || true
-                sleep 13
-              done
-              echo ">>> [YOUR PC] Done."
-            REMOTE_SCRIPT
+      # 让 Actions 挂起以保持工作流状态（如果不加这步，跑完就会显示绿色的成功并结束）
+      - name: Keep alive
+        run: |
+          echo "工作流已完成隧道建立。为了防止 Runner 立即销毁，这里保持挂起 4 小时。"
+          echo "如果不需要保持工作流状态，可以直接取消（Cancel）当前 Job，不会影响你电脑上的隧道。"
+          sleep 14400
