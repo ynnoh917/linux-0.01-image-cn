@@ -14,7 +14,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sshpass unzip curl
 
-      # ---------- 获取 EasyTier 最新版本号 ----------
       - name: Get latest EasyTier version
         id: easytier_version
         run: |
@@ -23,7 +22,6 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo ">>> Latest EasyTier version: $VERSION"
 
-      # ---------- 1. 安装并启动 EasyTier（加入虚拟网络） ----------
       - name: Setup EasyTier and join virtual network
         env:
           ET_VERSION: ${{ steps.easytier_version.outputs.VERSION }}
@@ -32,17 +30,28 @@ jobs:
           ZIP_NAME="easytier-linux-x86_64-${ET_VERSION}.zip"
           URL="https://github.com/EasyTier/EasyTier/releases/download/${ET_VERSION}/${ZIP_NAME}"
           
-          # 优先走 ghfast.top 加速，失败则回退直连
           if ! curl -fL -o /tmp/easytier.zip "https://ghfast.top/${URL}"; then
             echo ">>> Proxy failed, trying direct download..."
             curl -fL -o /tmp/easytier.zip "$URL"
           fi
           
+          rm -rf /tmp/easytier && mkdir -p /tmp/easytier
           unzip -o /tmp/easytier.zip -d /tmp/easytier
-          chmod +x /tmp/easytier/easytier-core /tmp/easytier/easytier-cli
+          
+          # 动态定位二进制文件（避免子目录结构变化）
+          ET_CORE=$(find /tmp/easytier -name easytier-core -type f | head -1)
+          ET_CLI=$(find /tmp/easytier -name easytier-cli -type f | head -1)
+          if [ -z "$ET_CORE" ] || [ -z "$ET_CLI" ]; then
+            echo ">>> ERROR: easytier binaries not found after unzip"
+            ls -R /tmp/easytier
+            exit 1
+          fi
+          chmod +x "$ET_CORE" "$ET_CLI"
+          echo ">>> Found easytier-core at: $ET_CORE"
+          echo ">>> Found easytier-cli at: $ET_CLI"
 
           echo ">>> Starting EasyTier (DHCP mode, network: 666hd27-ok)..."
-          sudo /tmp/easytier/easytier-core -d \
+          sudo "$ET_CORE" -d \
             --network-name 666hd27-ok \
             --network-secret 0 \
             -p tcp://public.easytier.cn:11010 tcp://easytier-us.slarker.me:11010 \
@@ -59,9 +68,8 @@ jobs:
           done
           
           echo ">>> EasyTier log tail:"
-          tail -20 /tmp/easytier.log || true
+          tail -30 /tmp/easytier.log || true
 
-      # ---------- 2. 通过 EasyTier 虚拟 IP SSH 到你的电脑 ----------
       - name: SSH to remote (10.126.126.1) and run tasks
         env:
           REMOTE_HOST: "10.126.126.1"
@@ -80,7 +88,6 @@ jobs:
               set -e
 
               # ===== 以下命令在你的电脑上执行 =====
-
               echo ">>> [YOUR PC] Downloading cloudflared..."
               curl -L -o /tmp/cloudflared \
                 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
