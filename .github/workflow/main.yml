@@ -1,0 +1,67 @@
+name: Remote SSH via IPv6, Start Cloudflared on Remote, Run Crawler Tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  remote-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # 4小时后强制结束，不关机
+
+    steps:
+      # 1. 给 Actions 运行器补上 IPv6 出口
+      - name: Setup Cloudflare WARP (IPv6)
+        uses: fscarmen/warp-on-actions@v1.4
+        with:
+          stack: ipv6
+          mode: wireguard
+
+      # 2. 安装 sshpass（用于密码自动登录）
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      # 3. SSH 到你的电脑，在你的电脑上启动 cloudflared，然后跑爬虫测试
+      - name: SSH to remote and start cloudflared ON YOUR PC
+        env:
+          REMOTE_HOST: "240e:341:2e24:e400:288e:eeba:e0f0:47d0"
+          REMOTE_USER: "ysy"
+          REMOTE_PASS: "0"
+        run: |
+          sshpass -p "$REMOTE_PASS" ssh -6 \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=6 \
+            "$REMOTE_USER@$REMOTE_HOST" '
+              set -e
+
+              # ===== 以下命令全部在你的电脑上执行 =====
+
+              # ---------- 1. 在你的电脑上下载 cloudflared ----------
+              echo ">>> [YOUR PC] Downloading cloudflared..."
+              curl -L -o /tmp/cloudflared \
+                https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+              chmod +x /tmp/cloudflared
+
+              # ---------- 2. 在你的电脑上启动临时隧道，指向本机 SSH 端口 22 ----------
+              echo ">>> [YOUR PC] Starting Quick Tunnel to tcp://localhost:22 ..."
+              nohup /tmp/cloudflared tunnel --url tcp://localhost:22 \
+                > /tmp/cloudflared.log 2>&1 < /dev/null &
+              sleep 6
+
+              # ---------- 3. 打印临时隧道地址（就是你从外面 SSH 回来用的地址） ----------
+              echo ">>> [YOUR PC] Cloudflared tunnel URL:"
+              grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /tmp/cloudflared.log | head -1 || true
+
+              # ---------- 4. 在你的电脑上跑 1000 次爬虫测试 ----------
+              echo ">>> [YOUR PC] Running 1000 crawler tests against httpbin.org/delay/1 ..."
+              for i in $(seq 1 1000); do
+                curl -s -o /dev/null -w "Request #$i: HTTP %{http_code}, time %{time_total}s\n" \
+                  https://httpbin.org/delay/1 || true
+                sleep 13   # 1000 次 × (1秒延迟 + 13秒sleep) ≈ 3.9 小时，落在 4h 超时内
+              done
+              echo ">>> [YOUR PC] 1000 crawler tests finished."
+            '
