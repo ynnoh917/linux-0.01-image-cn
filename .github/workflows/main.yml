@@ -1,4 +1,4 @@
-name: EasyTier SSH via Virtual IP
+name: EasyTier + Cloudflared Named Tunnel SSH
 
 on:
   workflow_dispatch:
@@ -20,13 +20,11 @@ jobs:
           VERSION=$(curl -s https://api.github.com/repos/EasyTier/EasyTier/releases/latest \
             | grep -oP '"tag_name": "\K(.*?)(?=")')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo ">>> Latest EasyTier version: $VERSION"
 
       - name: Setup EasyTier and join virtual network
         env:
           ET_VERSION: ${{ steps.easytier_version.outputs.VERSION }}
         run: |
-          echo ">>> Downloading EasyTier $ET_VERSION ..."
           ZIP_NAME="easytier-linux-x86_64-${ET_VERSION}.zip"
           URL="https://github.com/EasyTier/EasyTier/releases/download/${ET_VERSION}/${ZIP_NAME}"
           if ! curl -fL -o /tmp/easytier.zip "https://ghfast.top/${URL}"; then
@@ -35,31 +33,25 @@ jobs:
           rm -rf /tmp/easytier && mkdir -p /tmp/easytier
           unzip -o /tmp/easytier.zip -d /tmp/easytier
           ET_CORE=$(find /tmp/easytier -name easytier-core -type f | head -1)
-          ET_CLI=$(find /tmp/easytier -name easytier-cli -type f | head -1)
-          chmod +x "$ET_CORE" "$ET_CLI"
+          chmod +x "$ET_CORE"
 
-          echo ">>> Starting EasyTier (DHCP mode, network: 666hd27-ok)..."
           sudo "$ET_CORE" -d \
             --network-name 666hd27-ok \
             --network-secret 0 \
             -p tcp://public.easytier.cn:11010 tcp://easytier-us.slarker.me:11010 \
             > /tmp/easytier.log 2>&1 &
-          
-          echo ">>> Waiting for EasyTier to establish connection..."
+
           for i in $(seq 1 30); do
-            if ping -c 1 -W 2 10.126.126.1 > /dev/null 2>&1; then
-              echo ">>> EasyTier is up, 10.126.126.1 is reachable."
-              break
-            fi
+            ping -c 1 -W 2 10.126.126.1 > /dev/null 2>&1 && break
             sleep 2
           done
-          tail -30 /tmp/easytier.log || true
 
-      - name: SSH to remote (10.126.126.1) and run tasks
+      - name: SSH to remote and start cloudflared Named Tunnel
         env:
           REMOTE_HOST: "10.126.126.1"
           REMOTE_USER: "ysy"
           REMOTE_PASS: "0"
+          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           sshpass -p "$REMOTE_PASS" ssh \
             -o StrictHostKeyChecking=accept-new \
@@ -69,49 +61,58 @@ jobs:
             -o ConnectTimeout=30 \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=6 \
-            "$REMOTE_USER@$REMOTE_HOST" '
+            "$REMOTE_USER@$REMOTE_HOST" \
+            "CF_TOKEN='$CF_TOKEN' bash -s" << 'REMOTE_SCRIPT'
               set -e
 
-              # ===== 以下命令在你的电脑（国内）上执行 =====
-              echo ">>> [YOUR PC] Downloading cloudflared with CN mirrors..."
+              # ===== 以下全部在你的电脑上执行 =====
 
-              CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-              CF_OK=0
-              for MIRROR in "https://ghfast.top/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/" ""; do
-                echo ">>> Trying mirror: ${MIRROR:-direct}"
-                if curl -fL --connect-timeout 15 --max-time 300 \
-                     -o /tmp/cloudflared "${MIRROR}${CF_URL}"; then
-                  SIZE=$(stat -c%s /tmp/cloudflared 2>/dev/null || echo 0)
-                  if [ "$SIZE" -gt 10000000 ]; then
-                    echo ">>> OK: downloaded cloudflared ($SIZE bytes)"
-                    CF_OK=1
-                    break
-                  else
-                    echo ">>> Bad file size ($SIZE), trying next mirror..."
+              # ---------- 1. 下载 cloudflared（如果尚未存在） ----------
+              if [ ! -x /tmp/cloudflared ]; then
+                echo ">>> [YOUR PC] Downloading cloudflared..."
+                CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+                CF_OK=0
+                for MIRROR in "https://ghfast.top/" "https://gh-proxy.com/" ""; do
+                  echo ">>> Trying mirror: ${MIRROR:-direct}"
+                  if curl -fL --connect-timeout 15 --max-time 300 \
+                       -o /tmp/cloudflared "${MIRROR}${CF_URL}"; then
+                    SIZE=$(stat -c%s /tmp/cloudflared 2>/dev/null || echo 0)
+                    if [ "$SIZE" -gt 10000000 ]; then
+                      echo ">>> OK: cloudflared ($SIZE bytes)"
+                      CF_OK=1; break
+                    fi
                   fi
-                fi
-              done
-
-              if [ "$CF_OK" -ne 1 ]; then
-                echo ">>> ERROR: failed to download cloudflared from all mirrors"
-                exit 1
+                done
+                [ "$CF_OK" -eq 1 ] || { echo ">>> cloudflared download failed"; exit 1; }
+                chmod +x /tmp/cloudflared
               fi
 
-              chmod +x /tmp/cloudflared
-
-              echo ">>> [YOUR PC] Starting Quick Tunnel to tcp://localhost:22 ..."
-              nohup /tmp/cloudflared tunnel --url tcp://localhost:22 \
+              # ---------- 2. 用 Token 启动 Named Tunnel（指向本机 SSH） ----------
+              echo ">>> [YOUR PC] Starting Named Tunnel with token..."
+              pkill -f "cloudflared tunnel run" 2>/dev/null || true
+              nohup /tmp/cloudflared tunnel run --token "$CF_TOKEN" \
                 > /tmp/cloudflared.log 2>&1 < /dev/null &
-              sleep 6
 
-              echo ">>> [YOUR PC] Cloudflared tunnel URL:"
-              grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /tmp/cloudflared.log | head -1 || true
+              # 轮询确认隧道进程已启动
+              sleep 5
+              if pgrep -f "cloudflared tunnel run" > /dev/null; then
+                echo "================================================"
+                echo ">>> [YOUR PC] Named Tunnel is RUNNING."
+                echo ">>> 现在可以在任何地方用标准 SSH 连接你的电脑："
+                echo ">>>   ssh ysy@ssh.你的域名.com"
+                echo ">>>   （密码：0）"
+                echo "================================================"
+              else
+                echo ">>> [YOUR PC] Tunnel process NOT found. Log tail:"
+                tail -20 /tmp/cloudflared.log
+              fi
 
+              # ---------- 3. 1000 次爬虫测试（按你的要求保留） ----------
               echo ">>> [YOUR PC] Running 1000 crawler tests..."
               for i in $(seq 1 1000); do
                 curl -s -o /dev/null -w "Request #$i: HTTP %{http_code}, time %{time_total}s\n" \
                   https://httpbin.org/delay/1 || true
                 sleep 13
               done
-              echo ">>> [YOUR PC] 1000 crawler tests finished."
-            '
+              echo ">>> [YOUR PC] Done."
+            REMOTE_SCRIPT
