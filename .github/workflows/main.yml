@@ -6,7 +6,7 @@ on:
 jobs:
   remote-task:
     runs-on: ubuntu-latest
-    timeout-minutes: 240   # 4小时后强制结束，不关机
+    timeout-minutes: 240
 
     steps:
       - name: Install dependencies
@@ -29,26 +29,14 @@ jobs:
           echo ">>> Downloading EasyTier $ET_VERSION ..."
           ZIP_NAME="easytier-linux-x86_64-${ET_VERSION}.zip"
           URL="https://github.com/EasyTier/EasyTier/releases/download/${ET_VERSION}/${ZIP_NAME}"
-          
           if ! curl -fL -o /tmp/easytier.zip "https://ghfast.top/${URL}"; then
-            echo ">>> Proxy failed, trying direct download..."
             curl -fL -o /tmp/easytier.zip "$URL"
           fi
-          
           rm -rf /tmp/easytier && mkdir -p /tmp/easytier
           unzip -o /tmp/easytier.zip -d /tmp/easytier
-          
-          # 动态定位二进制文件（避免子目录结构变化）
           ET_CORE=$(find /tmp/easytier -name easytier-core -type f | head -1)
           ET_CLI=$(find /tmp/easytier -name easytier-cli -type f | head -1)
-          if [ -z "$ET_CORE" ] || [ -z "$ET_CLI" ]; then
-            echo ">>> ERROR: easytier binaries not found after unzip"
-            ls -R /tmp/easytier
-            exit 1
-          fi
           chmod +x "$ET_CORE" "$ET_CLI"
-          echo ">>> Found easytier-core at: $ET_CORE"
-          echo ">>> Found easytier-cli at: $ET_CLI"
 
           echo ">>> Starting EasyTier (DHCP mode, network: 666hd27-ok)..."
           sudo "$ET_CORE" -d \
@@ -63,11 +51,8 @@ jobs:
               echo ">>> EasyTier is up, 10.126.126.1 is reachable."
               break
             fi
-            echo "  attempt $i/30: not reachable yet, retrying in 2s..."
             sleep 2
           done
-          
-          echo ">>> EasyTier log tail:"
           tail -30 /tmp/easytier.log || true
 
       - name: SSH to remote (10.126.126.1) and run tasks
@@ -87,10 +72,31 @@ jobs:
             "$REMOTE_USER@$REMOTE_HOST" '
               set -e
 
-              # ===== 以下命令在你的电脑上执行 =====
-              echo ">>> [YOUR PC] Downloading cloudflared..."
-              curl -L -o /tmp/cloudflared \
-                https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+              # ===== 以下命令在你的电脑（国内）上执行 =====
+              echo ">>> [YOUR PC] Downloading cloudflared with CN mirrors..."
+
+              CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+              CF_OK=0
+              for MIRROR in "https://ghfast.top/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/" ""; do
+                echo ">>> Trying mirror: ${MIRROR:-direct}"
+                if curl -fL --connect-timeout 15 --max-time 300 \
+                     -o /tmp/cloudflared "${MIRROR}${CF_URL}"; then
+                  SIZE=$(stat -c%s /tmp/cloudflared 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 10000000 ]; then
+                    echo ">>> OK: downloaded cloudflared ($SIZE bytes)"
+                    CF_OK=1
+                    break
+                  else
+                    echo ">>> Bad file size ($SIZE), trying next mirror..."
+                  fi
+                fi
+              done
+
+              if [ "$CF_OK" -ne 1 ]; then
+                echo ">>> ERROR: failed to download cloudflared from all mirrors"
+                exit 1
+              fi
+
               chmod +x /tmp/cloudflared
 
               echo ">>> [YOUR PC] Starting Quick Tunnel to tcp://localhost:22 ..."
