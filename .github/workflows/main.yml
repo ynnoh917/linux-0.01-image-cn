@@ -1,4 +1,4 @@
-name: Remote SSH via IPv6, Start Cloudflared on Remote, Run Crawler Tests
+name: EasyTier SSH via Virtual IP
 
 on:
   workflow_dispatch:
@@ -9,25 +9,51 @@ jobs:
     timeout-minutes: 240   # 4小时后强制结束，不关机
 
     steps:
-      # 1. 给 Actions 运行器补上 IPv6 出口
-      - name: Setup Cloudflare WARP (IPv6)
-        uses: fscarmen/warp-on-actions@v1.4
-        with:
-          stack: ipv6
-          mode: wireguard
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass unzip curl
 
-      # 2. 安装 sshpass（用于密码自动登录）
-      - name: Install sshpass
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+      # ---------- 1. 安装并启动 EasyTier（加入虚拟网络） ----------
+      - name: Setup EasyTier and join virtual network
+        run: |
+          echo ">>> Downloading EasyTier..."
+          curl -L -o /tmp/easytier.zip \
+            https://github.com/EasyTier/EasyTier/releases/latest/download/easytier-linux-x86_64.zip
+          unzip -o /tmp/easytier.zip -d /tmp/easytier
+          chmod +x /tmp/easytier/easytier-core /tmp/easytier/easytier-cli
 
-      # 3. SSH 到你的电脑，在你的电脑上启动 cloudflared，然后跑爬虫测试
-      - name: SSH to remote and start cloudflared ON YOUR PC
+          echo ">>> Starting EasyTier (DHCP mode, network: 666hd27-ok)..."
+          # -d：自动分配虚拟IP（默认 10.126.126.0/24 网段）
+          # -p：指定两个公共初始节点
+          sudo /tmp/easytier/easytier-core -d \
+            --network-name 666hd27-ok \
+            --network-secret 0 \
+            -p tcp://public.easytier.cn:11010 tcp://easytier-us.slarker.me:11010 \
+            > /tmp/easytier.log 2>&1 &
+          
+          # 等待 EasyTier 建立 P2P 或中继连接
+          echo ">>> Waiting for EasyTier to establish connection..."
+          for i in $(seq 1 30); do
+            if ping -c 1 -W 2 10.126.126.1 > /dev/null 2>&1; then
+              echo ">>> EasyTier is up, 10.126.126.1 is reachable."
+              break
+            fi
+            echo "  attempt $i/30: not reachable yet, retrying in 2s..."
+            sleep 2
+          done
+          
+          echo ">>> EasyTier log tail:"
+          tail -20 /tmp/easytier.log || true
+
+      # ---------- 2. 通过 EasyTier 虚拟 IP SSH 到你的电脑 ----------
+      - name: SSH to remote (10.126.126.1) and run tasks
         env:
-          REMOTE_HOST: "240e:341:2e24:e400:288e:eeba:e0f0:47d0"
+          REMOTE_HOST: "10.126.126.1"
           REMOTE_USER: "ysy"
           REMOTE_PASS: "0"
         run: |
-          sshpass -p "$REMOTE_PASS" ssh -6 \
+          sshpass -p "$REMOTE_PASS" ssh \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o PreferredAuthentications=password \
@@ -38,30 +64,30 @@ jobs:
             "$REMOTE_USER@$REMOTE_HOST" '
               set -e
 
-              # ===== 以下命令全部在你的电脑上执行 =====
+              # ===== 以下命令在你的电脑上执行 =====
 
-              # ---------- 1. 在你的电脑上下载 cloudflared ----------
+              # 1. 下载 cloudflared
               echo ">>> [YOUR PC] Downloading cloudflared..."
               curl -L -o /tmp/cloudflared \
                 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
               chmod +x /tmp/cloudflared
 
-              # ---------- 2. 在你的电脑上启动临时隧道，指向本机 SSH 端口 22 ----------
+              # 2. 启动临时隧道，指向本机 SSH 端口 22
               echo ">>> [YOUR PC] Starting Quick Tunnel to tcp://localhost:22 ..."
               nohup /tmp/cloudflared tunnel --url tcp://localhost:22 \
                 > /tmp/cloudflared.log 2>&1 < /dev/null &
               sleep 6
 
-              # ---------- 3. 打印临时隧道地址（就是你从外面 SSH 回来用的地址） ----------
+              # 3. 打印临时隧道地址
               echo ">>> [YOUR PC] Cloudflared tunnel URL:"
               grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /tmp/cloudflared.log | head -1 || true
 
-              # ---------- 4. 在你的电脑上跑 1000 次爬虫测试 ----------
-              echo ">>> [YOUR PC] Running 1000 crawler tests against httpbin.org/delay/1 ..."
+              # 4. 1000 次爬虫测试（约 3.9 小时）
+              echo ">>> [YOUR PC] Running 1000 crawler tests..."
               for i in $(seq 1 1000); do
                 curl -s -o /dev/null -w "Request #$i: HTTP %{http_code}, time %{time_total}s\n" \
                   https://httpbin.org/delay/1 || true
-                sleep 13   # 1000 次 × (1秒延迟 + 13秒sleep) ≈ 3.9 小时，落在 4h 超时内
+                sleep 13
               done
               echo ">>> [YOUR PC] 1000 crawler tests finished."
             '
