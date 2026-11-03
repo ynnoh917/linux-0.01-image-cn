@@ -14,25 +14,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sshpass unzip curl
 
+      # ---------- 获取 EasyTier 最新版本号 ----------
+      - name: Get latest EasyTier version
+        id: easytier_version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/EasyTier/EasyTier/releases/latest \
+            | grep -oP '"tag_name": "\K(.*?)(?=")')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo ">>> Latest EasyTier version: $VERSION"
+
       # ---------- 1. 安装并启动 EasyTier（加入虚拟网络） ----------
       - name: Setup EasyTier and join virtual network
+        env:
+          ET_VERSION: ${{ steps.easytier_version.outputs.VERSION }}
         run: |
-          echo ">>> Downloading EasyTier..."
-          curl -L -o /tmp/easytier.zip \
-            https://github.com/EasyTier/EasyTier/releases/latest/download/easytier-linux-x86_64.zip
+          echo ">>> Downloading EasyTier $ET_VERSION ..."
+          ZIP_NAME="easytier-linux-x86_64-${ET_VERSION}.zip"
+          URL="https://github.com/EasyTier/EasyTier/releases/download/${ET_VERSION}/${ZIP_NAME}"
+          
+          # 优先走 ghfast.top 加速，失败则回退直连
+          if ! curl -fL -o /tmp/easytier.zip "https://ghfast.top/${URL}"; then
+            echo ">>> Proxy failed, trying direct download..."
+            curl -fL -o /tmp/easytier.zip "$URL"
+          fi
+          
           unzip -o /tmp/easytier.zip -d /tmp/easytier
           chmod +x /tmp/easytier/easytier-core /tmp/easytier/easytier-cli
 
           echo ">>> Starting EasyTier (DHCP mode, network: 666hd27-ok)..."
-          # -d：自动分配虚拟IP（默认 10.126.126.0/24 网段）
-          # -p：指定两个公共初始节点
           sudo /tmp/easytier/easytier-core -d \
             --network-name 666hd27-ok \
             --network-secret 0 \
             -p tcp://public.easytier.cn:11010 tcp://easytier-us.slarker.me:11010 \
             > /tmp/easytier.log 2>&1 &
           
-          # 等待 EasyTier 建立 P2P 或中继连接
           echo ">>> Waiting for EasyTier to establish connection..."
           for i in $(seq 1 30); do
             if ping -c 1 -W 2 10.126.126.1 > /dev/null 2>&1; then
@@ -66,23 +81,19 @@ jobs:
 
               # ===== 以下命令在你的电脑上执行 =====
 
-              # 1. 下载 cloudflared
               echo ">>> [YOUR PC] Downloading cloudflared..."
               curl -L -o /tmp/cloudflared \
                 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
               chmod +x /tmp/cloudflared
 
-              # 2. 启动临时隧道，指向本机 SSH 端口 22
               echo ">>> [YOUR PC] Starting Quick Tunnel to tcp://localhost:22 ..."
               nohup /tmp/cloudflared tunnel --url tcp://localhost:22 \
                 > /tmp/cloudflared.log 2>&1 < /dev/null &
               sleep 6
 
-              # 3. 打印临时隧道地址
               echo ">>> [YOUR PC] Cloudflared tunnel URL:"
               grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /tmp/cloudflared.log | head -1 || true
 
-              # 4. 1000 次爬虫测试（约 3.9 小时）
               echo ">>> [YOUR PC] Running 1000 crawler tests..."
               for i in $(seq 1 1000); do
                 curl -s -o /dev/null -w "Request #$i: HTTP %{http_code}, time %{time_total}s\n" \
